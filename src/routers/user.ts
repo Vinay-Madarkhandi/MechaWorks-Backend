@@ -255,7 +255,7 @@ router.get("/presignedUrl", authMiddleware, async (req, res) => {
 
 router.post("/signin", async(req, res) => {
     const { publicKey, signature } = req.body;
-    const message = new TextEncoder().encode("Sign into mechanical turks");
+    const message = new TextEncoder().encode("Sign into MechaWorks");
 
     const result = nacl.sign.detached.verify(
         message,
