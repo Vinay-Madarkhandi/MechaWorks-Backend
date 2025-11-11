@@ -14,34 +14,33 @@ const connection = new Connection(process.env.RPC_URL ?? "");
 const PARENT_WALLET_ADDRESS = "9isxjm1LY96pK8veLHYkHG72edjQ85A1qTbQjSFsfLC8";
     
 const DEFAULT_TITLE = "Select the most clickable thumbnail";
-// Check if required AWS credentials are present
-if (!process.env.ACCESS_KEY_ID || !process.env.ACCESS_SECRET) {
-    console.error('AWS credentials are missing. Please check environment variables.');
-    throw new Error('AWS credentials not configured');
+// Initialize S3 client if AWS credentials are present. Make S3 optional
+let s3Client: S3Client | undefined = undefined;
+let s3Configured = false;
+if (process.env.ACCESS_KEY_ID && process.env.ACCESS_SECRET) {
+    s3Client = new S3Client({
+        credentials: {
+            accessKeyId: process.env.ACCESS_KEY_ID,
+            secretAccessKey: process.env.ACCESS_SECRET,
+        },
+        region: process.env.AWS_REGION || "eu-north-1"
+    });
+
+    s3Configured = true;
+    // best-effort validation (do not throw on startup to avoid crashing dev env)
+    (async () => {
+        try {
+            await (s3Client as any).config.credentials();
+            console.log('S3 client initialized successfully');
+        } catch (error) {
+            console.error('Failed to initialize S3 client:', error);
+            s3Configured = false;
+            s3Client = undefined;
+        }
+    })();
+} else {
+    console.warn('AWS credentials are not provided. S3-backed endpoints will be disabled.');
 }
-
-// Initialize S3 client with validated credentials
-const s3Client = new S3Client({
-    credentials: {
-        accessKeyId: process.env.ACCESS_KEY_ID,
-        secretAccessKey: process.env.ACCESS_SECRET,
-    },
-    region: process.env.AWS_REGION || "eu-north-1"
-});
-
-// Wrap S3 validation in async function
-const validateS3Client = async () => {
-    try {
-        await s3Client.config.credentials();
-        console.log('S3 client initialized successfully');
-    } catch (error) {
-        console.error('Failed to initialize S3 client:', error);
-        throw new Error('S3 client initialization failed');
-    }
-};
-
-// Call the validation function
-validateS3Client();
 
 const router = Router();
 
@@ -232,20 +231,25 @@ router.post("/task", authMiddleware, async (req, res) => {
 router.get("/presignedUrl", authMiddleware, async (req, res) => {
     // @ts-ignore
     const userId = req.userId;
+    if (!s3Configured || !s3Client) {
+        return res.status(501).json({ message: 'S3 not configured on server' });
+    }
 
-    const { url, fields } = await createPresignedPost(s3Client, {
-        Bucket: 'final-yearrr',
-        Key: `${userId}/${Math.random()}/image.jpg`,
-        Conditions: [
-          ['content-length-range', 0, 5 * 1024 * 1024] // 5 MB max
-        ],
-        Expires: 3600
-    })
+    try {
+        const { url, fields } = await createPresignedPost(s3Client, {
+            Bucket: 'final-yearrr',
+            Key: `${userId}/${Math.random()}/image.jpg`,
+            Conditions: [
+              ['content-length-range', 0, 5 * 1024 * 1024] // 5 MB max
+            ],
+            Expires: 3600
+        })
 
-    res.json({
-        preSignedUrl: url,
-        fields
-    })
+        res.json({ preSignedUrl: url, fields });
+    } catch (err) {
+        console.error('Error creating presigned post:', err);
+        res.status(500).json({ message: 'Failed to create presigned url' });
+    }
     
 })
 

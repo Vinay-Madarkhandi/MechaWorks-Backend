@@ -40,68 +40,94 @@ router.post("/payout", workerMiddleware, async (req, res) => {
         })
     }
 
+    const pending = Number(worker.pending_amount ?? 0);
+    if (pending <= 0) {
+        return res.status(400).json({ message: 'No pending amount to payout' });
+    }
+
+    // Reserve funds atomically: move pending_amount -> locked_amount and create a payout record
+    let payoutRecord: any = null;
+    try {
+        const txResult = await prismaClient.$transaction(async tx => {
+            // Decrement pending and increment locked in one transaction
+            await tx.worker.update({
+                where: { id: Number(userId) },
+                data: {
+                    pending_amount: { decrement: pending },
+                    locked_amount: { increment: pending }
+                }
+            });
+
+            const p = await tx.payouts.create({
+                data: {
+                    user_id: Number(userId),
+                    amount: pending,
+                    status: "Processing",
+                    signature: ""
+                }
+            });
+
+            return p;
+        });
+
+        payoutRecord = txResult;
+    } catch (err) {
+        console.error('Error reserving payout funds:', err);
+        return res.status(500).json({ message: 'Failed to reserve funds for payout' });
+    }
+
+    // Build and send the on-chain transaction using the reserved amount
+    const lamports = Math.floor(1_000_000_000 * pending / TOTAL_DECIMALS);
     const transaction = new Transaction().add(
         SystemProgram.transfer({
             fromPubkey: new PublicKey("9isxjm1LY96pK8veLHYkHG72edjQ85A1qTbQjSFsfLC8"),
             toPubkey: new PublicKey(worker.address),
-            lamports: 1000_000_000 * worker.pending_amount / TOTAL_DECIMALS,
+            lamports,
         })
     );
 
-
-    console.log(worker.address);
-
     const keypair = Keypair.fromSecretKey(decode(privateKey));
 
-    // TODO: There's a double spending problem here
-    // The user can request the withdrawal multiple times
-    // Can u figure out a way to fix it?
     let signature = "";
     try {
-        signature = await sendAndConfirmTransaction(
-            connection,
-            transaction,
-            [keypair],
-        );
-    
-     } catch(e) {
-        return res.json({
-            message: "Transaction failed"
-        })
-     }
-    
-    console.log(signature)
+        signature = await sendAndConfirmTransaction(connection, transaction, [keypair]);
+    } catch (e) {
+        console.error('Blockchain transfer failed, reverting reserved funds:', e);
+        // revert DB reservation and mark payout Failed
+        try {
+            await prismaClient.$transaction(async tx => {
+                await tx.worker.update({
+                    where: { id: Number(userId) },
+                    data: {
+                        pending_amount: { increment: pending },
+                        locked_amount: { decrement: pending }
+                    }
+                });
 
-    // We should add a lock here
-    await prismaClient.$transaction(async tx => {
-        await tx.worker.update({
-            where: {
-                id: Number(userId)
-            },
-            data: {
-                pending_amount: {
-                    decrement: worker.pending_amount
-                },
-                locked_amount: {
-                    increment: worker.pending_amount
-                }
-            }
-        })
+                await tx.payouts.update({
+                    where: { id: payoutRecord.id },
+                    data: { status: 'Failure', signature: '' }
+                });
+            });
+        } catch (err2) {
+            console.error('Failed to revert reservation after failed transfer:', err2);
+        }
 
-        await tx.payouts.create({
-            data: {
-                user_id: Number(userId),
-                amount: worker.pending_amount,
-                status: "Processing",
-                signature: signature
-            }
-        })
-    })
+        return res.status(500).json({ message: 'Transaction failed' });
+    }
 
-    res.json({
-        message: "Processing payout",
-        amount: worker.pending_amount
-    })
+    // Update payout with signature and mark as Processing/Completed
+    try {
+        await prismaClient.payouts.update({
+            where: { id: payoutRecord.id },
+            data: { signature, status: 'Success' }
+        });
+    } catch (err) {
+        console.error('Failed to update payout record after successful transfer:', err);
+        // Do not revert funds here - manual reconciliation required
+    }
+
+    res.json({ message: 'Processing payout', amount: pending });
 
 
 })
